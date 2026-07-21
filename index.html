@@ -1,0 +1,1429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<title>RE Mogul</title>
+<meta name="description" content="Build a real estate empire from one property and $30K to $100,000,000. Seeded with a real Irving, TX deal." />
+
+<!-- Add-to-Home-Screen support (iOS + Android/Chrome) -->
+<link rel="manifest" href="manifest.json" />
+<meta name="theme-color" content="#12241C" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="RE Mogul" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png" />
+<link rel="icon" type="image/png" sizes="512x512" href="icon-512.png" />
+
+<!-- Tailwind (utility classes used by the game UI) -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- React 18 -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<!-- Babel standalone: lets the browser transpile the game's JSX with no build step -->
+<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<style>
+  html, body { margin: 0; padding: 0; background: #12241C; }
+  #root { min-height: 100vh; }
+  #boot-error { display:none; color:#E2694E; font-family: monospace; padding: 24px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<div id="boot-error"></div>
+
+<!-- Raw JSX source, not executed directly (type="text/plain") — we transform it ourselves below
+     so we can force the CLASSIC JSX runtime (React.createElement calls), which is what works
+     with a plain UMD React build and no module loader/import map. -->
+<script type="text/plain" id="app-source">
+const { useState, useMemo, useRef, useEffect } = React;
+
+
+/* ============ THEME ============ */
+const C = {
+  felt: "#12241C", felt2: "#1A3128", felt3: "#223E32", line: "#2E5245",
+  ink: "#F2EDDF", inkDim: "#A8B5A6", brass: "#D9A441", brassDim: "#8A6A2F",
+  sprout: "#7FBF9E", flare: "#E2694E", gold: "#F2C46D",
+};
+
+/* ============ HELPERS ============ */
+const fmt = (n) => {
+  const neg = n < 0, a = Math.abs(n);
+  let s;
+  if (a >= 1e6) s = "$" + (a / 1e6).toFixed(2) + "M";
+  else if (a >= 1e3) s = "$" + Math.round(a / 1e3) + "K";
+  else s = "$" + Math.round(a);
+  return neg ? "−" + s : s;
+};
+const fmtFull = (n) => (n < 0 ? "−$" : "$") + Math.abs(Math.round(n)).toLocaleString();
+const pmtCalc = (P, annualRate, years) => {
+  const r = annualRate / 12, n = Math.max(1, Math.round(years * 12));
+  return (P * r * Math.pow(1 + r, n)) / (Math.pow(1 + r, n) - 1);
+};
+const randInt = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+const randRange = (a, b) => a + Math.random() * (b - a);
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const gauss = () => (Math.random() + Math.random() + Math.random() - 1.5) / 1.5;
+const weighted = (weights) => {
+  const tot = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * tot;
+  for (let i = 0; i < weights.length; i++) { if (r < weights[i]) return i; r -= weights[i]; }
+  return weights.length - 1;
+};
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const dateLabel = (m) => { const d = new Date(2026, 7 + m, 1); return MONTHS[d.getMonth()] + " " + d.getFullYear(); };
+
+const LARGE_EXPENSE = 8000;
+const GOAL = 100000000;
+const START_CASH = 30000;
+const SAVE_KEY = "re-mogul-save-v1";
+
+function defaultGameState() {
+  return {
+    month: 0, cash: START_CASH, reserve: 0, treasury: 0.0388, treasuryMean: 0.04,
+    properties: [macarthur()],
+    market: [genDeal(0.0663), genDeal(0.0663), genDeal(0.0663), genDeal(0.0663), genDeal(0.0663), genDeal(0.0663), genDeal(0.0663)],
+    escrow: null,
+    log: [{ m: 0, t: `Game start. You own the MacArthur property and $${START_CASH.toLocaleString()} in reserves. Goal: $100,000,000 net worth. Build carefully — the cushion is thin.`, k: "sys" }],
+    ach: [], queue: [], goalHit: false,
+  };
+}
+function loadSave() {
+  try {
+    const raw = localStorage.getItem(SAVE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.month === "number" && Array.isArray(parsed.properties)) return parsed;
+  } catch (e) { /* corrupt save, ignore */ }
+  return null;
+}
+
+/* ============ ANIMATION HOOKS ============ */
+function useAnimatedNumber(target, duration = 700) {
+  const [display, setDisplay] = useState(target);
+  const rafRef = useRef();
+  const fromRef = useRef(target);
+  useEffect(() => {
+    const from = fromRef.current;
+    const start = performance.now();
+    cancelAnimationFrame(rafRef.current);
+    const tick = (now) => {
+      const t = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - t, 3);
+      setDisplay(from + (target - from) * eased);
+      if (t < 1) rafRef.current = requestAnimationFrame(tick);
+      else fromRef.current = target;
+    };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target, duration]);
+  return display;
+}
+
+/* ============ LEASE STRUCTURES ============ */
+const LEASE_TYPES = [
+  { code: "NNN", label: "Triple Net (NNN)", taxPass: 0.95, insPass: 0.90, camPass: 0.85, capexExposure: 0.20, rateAdj: -0.0010, ltvAdj: 0.03,
+    desc: "Tenant reimburses taxes, insurance & CAM. Landlord typically retains roof/structure risk." },
+  { code: "NN", label: "Double Net (NN)", taxPass: 0.90, insPass: 0.75, camPass: 0.40, capexExposure: 0.55, rateAdj: 0, ltvAdj: 0,
+    desc: "Tenant reimburses taxes & insurance. Landlord covers roof, structure, and most CAM." },
+  { code: "N", label: "Single Net (N)", taxPass: 0.85, insPass: 0.10, camPass: 0.10, capexExposure: 0.80, rateAdj: 0.0015, ltvAdj: -0.02,
+    desc: "Tenant reimburses property taxes only. Landlord carries insurance, CAM, and repairs." },
+  { code: "Gross", label: "Full-Service Gross", taxPass: 0.0, insPass: 0.0, camPass: 0.0, capexExposure: 1.0, rateAdj: 0.0030, ltvAdj: -0.05,
+    desc: "Landlord pays taxes, insurance, CAM and repairs out of rental income — rent is priced higher to compensate." },
+];
+
+/* ============ TENANT CREDIT MODEL ============ */
+const CREDIT_TIERS = [
+  { tier: "Investment Grade", grade: "Corporate-guaranteed", color: "#7FBF9E",
+    desc: "Public/rated corporate guarantee, audited financials on file.",
+    capAdj: -0.010, renewalProb: 0.95, defaultRiskMo: 0.0001, downMonths: [3, 7], tiCost: [14, 22], leaseTermYears: [10, 18] },
+  { tier: "Strong Regional", grade: "Multi-unit operator", color: "#8FC7D9",
+    desc: "Established regional operator, multiple locations, audited books.",
+    capAdj: 0, renewalProb: 0.85, defaultRiskMo: 0.0004, downMonths: [4, 9], tiCost: [18, 28], leaseTermYears: [6, 12] },
+  { tier: "Franchisee", grade: "Single-unit, personal guar.", color: C.brass,
+    desc: "Single-unit franchisee. Rent backed by a personal guarantee, not a corporate one.",
+    capAdj: 0.012, renewalProb: 0.70, defaultRiskMo: 0.0014, downMonths: [6, 12], tiCost: [22, 34], leaseTermYears: [3, 7] },
+  { tier: "Local / Unproven", grade: "New concept, thin file", color: C.flare,
+    desc: "Independent operator, no track record, weak or no guarantee. Highest re-tenant risk.",
+    capAdj: 0.024, renewalProb: 0.52, defaultRiskMo: 0.0038, downMonths: [8, 18], tiCost: [26, 42], leaseTermYears: [1, 4] },
+];
+// When a tenant leaves, the replacement's credit quality correlates with who was just there —
+// a property that held an Investment Grade tenant tends to attract another strong one, not a random draw.
+const TIER_TRANSITION_WEIGHTS = [
+  [45, 35, 15, 5],   // was Investment Grade
+  [15, 40, 30, 15],  // was Strong Regional
+  [5, 20, 45, 30],   // was Franchisee
+  [3, 12, 35, 50],   // was Local / Unproven
+];
+const weightedTier = () => weighted([10, 28, 37, 25]);
+const SURNAMES = ["Meridian","Cornerstone","Prairie","Southfork","Vantage","Northgate","Bluebonnet","Trinity","Red River","Lakeside","Silver Oak","Longhorn","Rahimi","Okafor","Delgado","Kowalski","Patel","Nguyen"];
+const IG_NAMES = ["National Retail Corp.","Sunbelt Convenience Holdings Inc.","Consolidated Brands LLC","American QSR Group Inc."];
+const genTenantName = (tierIdx) => {
+  if (tierIdx === 0) return pick(IG_NAMES);
+  if (tierIdx === 1) return pick(SURNAMES) + " Retail Partners LLC";
+  if (tierIdx === 2) return pick(SURNAMES) + " Enterprises, dba operator";
+  return pick(SURNAMES) + " Family Holdings (DBA)";
+};
+
+/* ============ PROPERTY TYPES (drive tax/insurance/risk/leverage/lease bias) ============ */
+const DEAL_TYPES = [
+  // ---- small ($150K-$650K) ----
+  { name: "Corner Taco Kiosk", emoji: "🌯", sub: "Walk-up counter · Oak Cliff", sqftRange: [500, 1000], priceRange: [150000, 400000],
+    insRange: [0.006, 0.010], riskMult: 1.2, typeRateAdj: 0.0015, amortYears: 20, leaseWeights: [40, 25, 25, 10] },
+  { name: "Drive-Thru Coffee Kiosk", emoji: "☕", sub: "Single-lane · Denton", sqftRange: [300, 700], priceRange: [180000, 450000],
+    insRange: [0.005, 0.008], riskMult: 1.05, typeRateAdj: 0.0010, amortYears: 20, leaseWeights: [50, 20, 20, 10] },
+  { name: "Neighborhood Laundromat", emoji: "🧺", sub: "Self-serve · Garland", sqftRange: [1500, 2800], priceRange: [250000, 650000],
+    insRange: [0.005, 0.008], riskMult: 1.1, typeRateAdj: 0.0005, amortYears: 22, leaseWeights: [30, 30, 25, 15] },
+  { name: "Single-Suite Barbershop", emoji: "💈", sub: "1 tenant · Oak Cliff", sqftRange: [700, 1400], priceRange: [200000, 500000],
+    insRange: [0.004, 0.007], riskMult: 1.0, typeRateAdj: 0.0010, amortYears: 20, leaseWeights: [25, 25, 25, 25] },
+  // ---- mid ($600K-$4.5M) ----
+  { name: "MedSpa Office Condo", emoji: "🩺", sub: "2 suites · Las Colinas", sqftRange: [2200, 4200], priceRange: [500000, 1400000],
+    insRange: [0.003, 0.005], riskMult: 0.85, typeRateAdj: 0.0010, amortYears: 22, leaseWeights: [10, 30, 15, 45] },
+  { name: "Taqueria Pad Site", emoji: "🌮", sub: "Drive-thru QSR · Arlington", sqftRange: [1600, 2600], priceRange: [700000, 1800000],
+    insRange: [0.006, 0.009], riskMult: 1.1, typeRateAdj: 0.0005, amortYears: 25, leaseWeights: [65, 20, 10, 5] },
+  { name: "Frisco Nail & Retail", emoji: "💅", sub: "3 tenants · Frisco", sqftRange: [3200, 5800], priceRange: [800000, 2000000],
+    insRange: [0.005, 0.007], riskMult: 1.0, typeRateAdj: 0, amortYears: 25, leaseWeights: [30, 35, 20, 15] },
+  { name: "Cedar Hill Wash & Lube", emoji: "🚗", sub: "Combo site · Cedar Hill", sqftRange: [2400, 3800], priceRange: [850000, 2000000],
+    insRange: [0.009, 0.012], riskMult: 1.3, typeRateAdj: 0.0018, amortYears: 20, leaseWeights: [50, 30, 15, 5] },
+  { name: "Lone Star Car Wash", emoji: "🫧", sub: "Express tunnel · Grand Prairie", sqftRange: [1800, 3200], priceRange: [900000, 2200000],
+    insRange: [0.008, 0.012], riskMult: 1.3, typeRateAdj: 0.0015, amortYears: 20, leaseWeights: [55, 25, 15, 5] },
+  { name: "QuikLube + C-Store", emoji: "🛢️", sub: "Fuel + service · Mesquite", sqftRange: [2800, 4600], priceRange: [1000000, 2400000],
+    insRange: [0.009, 0.013], riskMult: 1.35, typeRateAdj: 0.0020, amortYears: 20, leaseWeights: [50, 30, 15, 5] },
+  { name: "Single-Tenant Bank Branch", emoji: "🏦", sub: "Corporate NNN · Plano", sqftRange: [2500, 4500], priceRange: [900000, 2200000],
+    insRange: [0.003, 0.005], riskMult: 0.8, typeRateAdj: -0.0010, amortYears: 25, leaseWeights: [75, 15, 7, 3] },
+  { name: "Dollar General NNN", emoji: "🏪", sub: "Corporate lease · Ennis", sqftRange: [8500, 10500], priceRange: [1400000, 2600000],
+    insRange: [0.004, 0.006], riskMult: 0.9, typeRateAdj: -0.0010, amortYears: 25, leaseWeights: [80, 15, 4, 1] },
+  { name: "Beltline Strip Center", emoji: "🏬", sub: "4 inline tenants · Irving", sqftRange: [4500, 9000], priceRange: [1200000, 3500000],
+    insRange: [0.005, 0.007], riskMult: 1.0, typeRateAdj: 0, amortYears: 25, leaseWeights: [35, 35, 20, 10] },
+  { name: "Mockingbird Office Row", emoji: "🏢", sub: "3 suites · Dallas", sqftRange: [3800, 7000], priceRange: [1200000, 3200000],
+    insRange: [0.004, 0.006], riskMult: 0.9, typeRateAdj: 0.0010, amortYears: 22, leaseWeights: [10, 25, 20, 45] },
+  { name: "Storage Flex Units", emoji: "📦", sub: "18 doors · Lancaster", sqftRange: [12000, 22000], priceRange: [1500000, 4500000],
+    insRange: [0.003, 0.004], riskMult: 0.6, typeRateAdj: -0.0015, amortYears: 28, leaseWeights: [50, 20, 25, 5] },
+  // ---- large ($3.5M-$22M) ----
+  { name: "Boutique Hotel", emoji: "🏨", sub: "42 keys · Deep Ellum", sqftRange: [15000, 35000], priceRange: [3500000, 9000000],
+    insRange: [0.007, 0.010], riskMult: 1.15, typeRateAdj: 0.0020, amortYears: 22, leaseWeights: [15, 25, 20, 40] },
+  { name: "Big-Box Anchor", emoji: "🛒", sub: "Former anchor box · Mesquite", sqftRange: [35000, 80000], priceRange: [3500000, 9000000],
+    insRange: [0.004, 0.006], riskMult: 0.95, typeRateAdj: 0, amortYears: 25, leaseWeights: [45, 30, 15, 10] },
+  { name: "Medical Office Building", emoji: "🏥", sub: "Multi-specialty · Plano", sqftRange: [15000, 45000], priceRange: [3000000, 8000000],
+    insRange: [0.004, 0.006], riskMult: 0.85, typeRateAdj: 0, amortYears: 25, leaseWeights: [20, 35, 20, 25] },
+  { name: "Corporate Office Tower Floor", emoji: "🏙️", sub: "Full floor · Uptown Dallas", sqftRange: [10000, 30000], priceRange: [4000000, 11000000],
+    insRange: [0.003, 0.005], riskMult: 0.8, typeRateAdj: 0.0010, amortYears: 25, leaseWeights: [10, 25, 20, 45] },
+  { name: "Industrial Distribution Warehouse", emoji: "🏭", sub: "Cross-dock · Wilmer", sqftRange: [60000, 150000], priceRange: [4000000, 12000000],
+    insRange: [0.003, 0.005], riskMult: 0.75, typeRateAdj: -0.0015, amortYears: 25, leaseWeights: [55, 25, 15, 5] },
+  { name: "Regional Surgical Hospital", emoji: "🏥", sub: "Ambulatory surgical center · Frisco", sqftRange: [50000, 140000], priceRange: [9000000, 22000000],
+    insRange: [0.005, 0.008], riskMult: 1.0, typeRateAdj: 0.0005, amortYears: 25, leaseWeights: [30, 40, 20, 10] },
+];
+
+/* ============ UNIFIED EXPENSE EVENTS (base $ per $1M of property value) ============ */
+const EVENT_TYPES = [
+  ["Roof repair/replacement", 3500, 9000],
+  ["HVAC service/replacement", 3000, 7000],
+  ["Parking lot / paving", 3500, 8500],
+  ["Storm / casualty damage", 3000, 11000],
+  ["Structural / foundation", 4500, 13000],
+  ["Plumbing / mechanical", 800, 2500],
+  ["Pest control / landscaping / general upkeep", 400, 1500],
+  ["Signage / facade repair", 600, 2200],
+  ["Environmental / underground systems", 2500, 8000],
+];
+
+let dealSeq = 0;
+const genDeal = (marketRate) => {
+  const t = DEAL_TYPES[Math.floor(Math.random() * DEAL_TYPES.length)];
+  const roundTo = t.priceRange[1] > 5000000 ? 50000 : t.priceRange[1] > 1500000 ? 25000 : 5000;
+  const price = Math.round(randRange(t.priceRange[0], t.priceRange[1]) / roundTo) * roundTo;
+  const tierIdx = weightedTier();
+  const tier = CREDIT_TIERS[tierIdx];
+  const expectedCap = 0.058 + tier.capAdj;
+  const cap = Math.max(0.045, expectedCap + (Math.random() - 0.35) * 0.024);
+  const hot = cap > expectedCap + 0.009;
+  const noiAnnual = price * cap;
+  const sqft = Math.round(randInt(t.sqftRange[0], t.sqftRange[1]) / 100) * 100;
+  const leaseYearsLeft = randInt(Math.max(1, Math.floor(tier.leaseTermYears[0] / 2)), tier.leaseTermYears[1]);
+
+  const leaseTypeIdx = weighted(t.leaseWeights);
+  const lease = LEASE_TYPES[leaseTypeIdx];
+  const taxRate = randRange(0.018, 0.024);
+  const insRate = randRange(t.insRange[0], t.insRange[1]);
+  const camRate = randRange(0.002, 0.004);
+  const taxAnnual = price * taxRate;
+  const insAnnual = price * insRate;
+  const camAnnual = price * camRate;
+  const landlordOpexAnnual = taxAnnual * (1 - lease.taxPass) + insAnnual * (1 - lease.insPass) + camAnnual * (1 - lease.camPass);
+  const grossRentAnnual = noiAnnual + landlordOpexAnnual; // back-solved so marketed cap = NOI/price
+  const grossRentMo = grossRentAnnual / 12;
+  const landlordOpexMo = landlordOpexAnnual / 12;
+  const noiMo = grossRentMo - landlordOpexMo;
+
+  const rate = Math.max(0.03, marketRate + lease.rateAdj + t.typeRateAdj);
+  const ltv = Math.min(0.75, Math.max(0.55, 0.70 + lease.ltvAdj));
+
+  return {
+    id: "deal" + ++dealSeq, ...t, price, cap, noiMo, rate, sqft, ltv,
+    tenantName: genTenantName(tierIdx), tierIdx, leaseYearsLeft,
+    leaseTypeIdx, taxAnnual, insAnnual, camAnnual, landlordOpexMo, grossRentMo,
+    hot, ttl: hot ? randInt(1, 3) : randInt(4, 10),
+  };
+};
+
+/* ============ MACARTHUR (seeded real deal) ============ */
+const macarthur = () => ({
+  id: "mac", name: "10025 N. MacArthur Blvd", sub: "7-Eleven + Kabobs To Go · Irving, TX",
+  emoji: "⛽", sqft: 3400, basis: 2500000, value: 2500000, boughtMonth: 0,
+  riskMult: 1.25, capexExposure: 0.15, leaseLabel: "Mixed — 7-Eleven Absolute NNN + Kabobs NN",
+  loan: { balance: 1700000, originalAmount: 1700000, rate: 0.0675, originRate: 0.0675, payment: 12926.19, originMonth: -5, amortYears: 20,
+    resets: [55, 115, 175], floor: 0.0675, lender: "Prosperity Bank" },
+  kabobs: { status: "occupied", rent: 4500, secured: false, darkUntil: null },
+  isMac: true,
+});
+
+const ACH_DEFS = {
+  lump: "🪙 Curtailment Curious — first extra principal payment",
+  warchest: "💼 War Chest — $500K+ stashed between cash & reserve",
+  freeclear: "🎉 Free & Clear — paid a loan to zero",
+  empire: "🏙️ Empire Builder — own 3+ properties",
+  vacancy: "🧯 Vacancy Veteran — survived a dark suite",
+  exchange: "🔄 Exchange Artist — completed a 1031",
+  sniped: "🏃 Missed It — watched a hot deal get sniped",
+  mogul: "👑 MacArthur Mogul — $100M net worth",
+};
+
+/* ============ SHARED FINANCIAL LOGIC (used identically for tick + display, all properties) ============ */
+function incomeOpexFor(p, m) {
+  if (p.isMac) {
+    const r711 = m < 98 ? 12000 : m < 158 ? 13200 : 14520;
+    let income = r711, opex = 1167 * Math.pow(1.03, m / 12);
+    if (p.kabobs.status === "occupied") income += p.kabobs.rent;
+    else opex += 850;
+    return { income, opex };
+  }
+  const yrs = Math.max(0, (m - p.boughtMonth) / 12);
+  if (p.status === "occupied") {
+    return { income: p.grossRentBase * Math.pow(1.02, yrs), opex: p.landlordOpexBase * Math.pow(1.03, yrs) };
+  }
+  return { income: 0, opex: p.landlordOpexBase * Math.pow(1.03, yrs) + 250 * (p.sqft / 2000) };
+}
+
+/* ============ MAIN APP ============ */
+function App() {
+  const [g, setG] = useState(() => loadSave() || defaultGameState());
+  const [modal, setModal] = useState(null);
+  const [lumpAmt, setLumpAmt] = useState("");
+  const [resAmt, setResAmt] = useState("");
+  const [escrowInput, setEscrowInput] = useState("");
+  const [started, setStarted] = useState(() => !!loadSave());
+  const [toasts, setToasts] = useState([]);
+  const [confettiKey, setConfettiKey] = useState(0);
+  const [showCelebration, setShowCelebration] = useState(false);
+  const prevAchLen = useRef(0);
+  const logRef = useRef(null);
+
+  const fireConfetti = () => setConfettiKey((k) => k + 1);
+  const fireToast = (text) => {
+    const id = Math.random().toString(36).slice(2);
+    setToasts((ts) => [...ts, { id, text }]);
+    setTimeout(() => setToasts((ts) => ts.filter((t) => t.id !== id)), 3400);
+  };
+
+  // Achievement unlocks fire a toast + confetti, decoupled from game-tick logic
+  useEffect(() => {
+    if (g.ach.length > prevAchLen.current) {
+      const newOnes = g.ach.slice(prevAchLen.current);
+      newOnes.forEach((key) => fireToast(ACH_DEFS[key]));
+      fireConfetti();
+    }
+    prevAchLen.current = g.ach.length;
+  }, [g.ach.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (g.goalHit && !showCelebration) { setShowCelebration(true); fireConfetti(); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [g.goalHit]);
+
+  // Autosave to this device — this is a real webpage (not a Claude.ai artifact), so localStorage works
+  // and persists whether opened in a browser tab or launched from a home-screen icon.
+  const [lastSaved, setLastSaved] = useState(null);
+  useEffect(() => {
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify(g));
+      setLastSaved(new Date());
+    } catch (e) { /* storage full or unavailable — fail silently, game still playable */ }
+  }, [g]);
+
+  const newGame = () => {
+    if (window.confirm("Start a brand new empire? This erases your current save on this device.")) {
+      try { localStorage.removeItem(SAVE_KEY); } catch (e) {}
+      window.location.reload();
+    }
+  };
+
+  const marketRate = g.treasury + 0.0275;
+
+  const netWorth = useMemo(() => {
+    const propEq = g.properties.reduce((s, p) => s + p.value - p.loan.balance, 0);
+    return g.cash + g.reserve + (g.escrow ? g.escrow.amount : 0) + propEq;
+  }, [g]);
+
+  /* ---------- core tick ---------- */
+  const runMonths = (n) => {
+    setG((prev) => {
+      const s = JSON.parse(JSON.stringify(prev));
+      const logs = [];
+      const addLog = (t, k = "info") => logs.push({ m: s.month, t, k });
+      const unlock = (key) => { if (!s.ach.includes(key)) { s.ach.push(key); logs.push({ m: s.month, t: ACH_DEFS[key], k: "ach" }); } };
+      const alert = (title, body) => s.queue.push({ kind: "alert", title, body });
+
+      for (let i = 0; i < n; i++) {
+        if (s.queue.length) break;
+        s.month += 1;
+        const m = s.month;
+
+        if (s.reserve > 0) s.reserve *= 1 + s.treasury / 12;
+
+        if (m % 12 === 0) s.treasuryMean = Math.min(0.06, Math.max(0.025, s.treasuryMean + (Math.random() - 0.5) * 0.006));
+        const reversion = (s.treasuryMean - s.treasury) * 0.045;
+        const noise = gauss() * 0.0016;
+        let shock = 0;
+        if (Math.random() < 0.035) {
+          shock = (Math.random() < 0.5 ? -1 : 1) * (0.001 + Math.random() * 0.0016);
+          addLog(shock > 0 ? "Fed commentary spooks the bond market — yields tick up sharply." : "Cooler inflation print — yields ease sharply.", "warn");
+        }
+        s.treasury = Math.min(0.08, Math.max(0.015, s.treasury + reversion + noise + shock));
+
+        if (s.escrow && m > s.escrow.deadline) {
+          const tax = 0.25 * Math.max(0, s.escrow.gain);
+          s.cash += s.escrow.amount - tax;
+          addLog(`1031 window expired. Escrow released ${fmt(s.escrow.amount)} minus ${fmt(tax)} capital gains tax.`, "bad");
+          s.escrow = null;
+        }
+
+        for (const p of s.properties) {
+          /* ---- lifecycle / status transitions (mutate first) ---- */
+          if (p.isMac) {
+            if (m === 98) addLog("7-Eleven rent stepped up to $13,200/mo per lease.", "good");
+            if (m === 158) addLog("7-Eleven rent stepped up to $14,520/mo per lease.", "good");
+            const kb = p.kabobs;
+            if (kb.status === "dark" && m >= kb.darkUntil) {
+              kb.status = "occupied"; kb.rent = 4900; s.cash -= 25000;
+              addLog("New tenant signed for the 544sf suite at $4,900/mo. TI/leasing cost: $25K.", "good");
+              unlock("vacancy");
+            }
+            if (m === 90 && kb.status === "occupied" && !kb.secured) {
+              s.queue.push({
+                kind: "decision", title: "Kabobs To Go — early renewal window",
+                body: "Rahimi's lease expires Jul 2037 with no option. Offer a $15K TI package now to lock a 10-year extension at $4,800/mo?",
+                options: [
+                  { label: "Pay $15K — lock the renewal", id: "kabobs-secure" },
+                  { label: "Pass — take our chances in 2037", id: "kabobs-pass" },
+                ],
+              });
+              addLog("Decision needed: Kabobs early-renewal window is open.", "warn");
+            }
+            if (m === 131 && kb.status === "occupied") {
+              if (kb.secured) { kb.rent = 4800; addLog("Kabobs renewed on the locked extension — $4,800/mo for 10 more years.", "good"); }
+              else if (Math.random() < 0.55) addLog("Kabobs To Go renewed flat at expiry. Dodged one.", "good");
+              else {
+                kb.status = "dark"; kb.darkUntil = m + randInt(6, 18);
+                alert("🏚️ Kabobs To Go went dark", `The 544sf suite did not renew at expiry (Jul 2037). Rent stops immediately; you're still carrying utilities/CAM until re-leased around ${dateLabel(m + randInt(6,18))}.`);
+                addLog("Kabobs To Go went dark at lease expiry. Suite vacant.", "bad");
+              }
+            }
+            if (m === 216) {
+              if (Math.random() < 0.85) addLog("7-Eleven franchisee renewed at expiry (+10% rent).", "good");
+              else addLog("7-Eleven franchisee did not renew?! (Simplified: corporate re-let, rent continues.)", "warn");
+            }
+            if (p.loan.resets.includes(m) && p.loan.balance > 0) {
+              const newRate = Math.max(p.loan.floor, s.treasury + 0.0287);
+              const elapsed = m - p.loan.originMonth;
+              const remYears = Math.max(1, (p.loan.amortYears * 12 - elapsed) / 12);
+              const oldPmt = p.loan.payment;
+              p.loan.rate = newRate;
+              p.loan.payment = pmtCalc(p.loan.balance, newRate, remYears);
+              addLog(`RATE RESET (${p.loan.lender}): ${(newRate * 100).toFixed(2)}% — payment re-amortized ${fmt(oldPmt)} → ${fmt(p.loan.payment)}/mo on ${fmt(p.loan.balance)} balance.`, newRate > 0.0676 ? "warn" : "good");
+            }
+          } else {
+            const tier = CREDIT_TIERS[p.tierIdx];
+            if (p.status === "occupied") {
+              p.leaseMonthsLeft -= 1;
+              let vacated = false;
+              if (p.leaseMonthsLeft <= 0) {
+                if (Math.random() > tier.renewalProb) vacated = true;
+                else { p.leaseMonthsLeft = randInt(tier.leaseTermYears[0], tier.leaseTermYears[1]) * 12; p.grossRentBase *= 1.02; addLog(`${p.tenantName} renewed at ${p.name} — locked in for another ${Math.round(p.leaseMonthsLeft/12)} years.`, "good"); }
+              } else if (Math.random() < tier.defaultRiskMo) vacated = true;
+              if (vacated) {
+                p.status = "dark"; p.darkUntil = m + randInt(tier.downMonths[0], tier.downMonths[1]);
+                alert(`🏚️ Tenant vacated — ${p.name}`, `${p.tenantName} (${tier.tier}) is out. NOI stops now; carrying costs continue until re-leased around ${dateLabel(p.darkUntil)}. Tenant credit strength predicted this risk.`);
+                addLog(`${p.tenantName} vacated ${p.name} — suite dark.`, "bad");
+              }
+            } else if (p.status === "dark" && m >= p.darkUntil) {
+              const newTierIdx = weighted(TIER_TRANSITION_WEIGHTS[p.tierIdx]);
+              const newTier = CREDIT_TIERS[newTierIdx];
+              const tiCost = randInt(newTier.tiCost[0], newTier.tiCost[1]) * p.sqft;
+              s.cash -= tiCost;
+              p.status = "occupied"; p.tierIdx = newTierIdx; p.tenantName = genTenantName(newTierIdx); p.leaseMonthsLeft = randInt(newTier.leaseTermYears[0], newTier.leaseTermYears[1]) * 12;
+              if (tiCost >= LARGE_EXPENSE) alert(`🔨 Re-leased — ${p.name}`, `${p.tenantName} (${newTier.tier}) signed. Tenant-improvement / leasing cost: ${fmtFull(tiCost)}, deducted now.`);
+              else addLog(`${p.tenantName} (${newTier.tier}) signed at ${p.name}. TI cost ${fmt(tiCost)}.`, "good");
+              unlock("vacancy");
+            }
+          }
+
+          /* ---- financials: income, opex, debt service (unified for all properties) ---- */
+          const { income, opex } = incomeOpexFor(p, m);
+          let ds = 0;
+          if (p.loan.balance > 0) {
+            const int = (p.loan.balance * p.loan.rate) / 12;
+            const prin = Math.min(p.loan.payment - int, p.loan.balance);
+            ds = int + Math.max(0, prin);
+            p.loan.balance = Math.max(0, p.loan.balance - Math.max(0, prin));
+            if (p.loan.balance === 0) { addLog(`${p.name} is FREE & CLEAR. ${fmt(p.loan.payment)}/mo debt service ends.`, "good"); unlock("freeclear"); }
+          }
+          p.value *= 1 + (0.02 + (Math.random() - 0.5) * 0.01) / 12;
+          s.cash += income - opex - ds;
+
+          /* ---- unified expense-event engine: scales with value, property risk, and lease exposure ---- */
+          const roll = Math.random();
+          if (roll < 0.09) {
+            const [txt, lo, hi] = pick(EVENT_TYPES);
+            const scale = p.value / 1000000;
+            const riskMult = p.riskMult || 1.0;
+            const exposure = p.isMac ? p.capexExposure : LEASE_TYPES[p.leaseTypeIdx].capexExposure;
+            const grossAmt = randInt(lo, hi) * scale * riskMult;
+            const landlordAmt = Math.round(grossAmt * exposure);
+            if (landlordAmt >= 25) {
+              s.cash -= landlordAmt;
+              if (landlordAmt >= LARGE_EXPENSE) {
+                alert(`🚨 Major expense — ${p.name}`, `${txt}: ${fmtFull(landlordAmt)} deducted from cash just now. (Lease structure absorbed the rest.) Check your reserves.`);
+                addLog(`${txt} at ${p.name}: −${fmt(landlordAmt)}.`, "bad");
+              } else {
+                addLog(`${txt} at ${p.name}: −${fmt(landlordAmt)}${exposure < 1 ? " (lease passed most of it through)" : ""}.`, "bad");
+              }
+            }
+          } else if (roll < 0.11) {
+            const gain = p.value * randRange(0.0006, 0.0015);
+            s.cash += gain;
+            addLog(`Property-tax protest won at ${p.name}: +${fmt(gain)}.`, "good");
+          }
+        }
+
+        if (s.cash < 0) {
+          s.cash *= 1.01;
+          if (Math.random() < 0.25) addLog("Running on the credit line — 12% APR is accruing on negative cash.", "bad");
+        }
+        if (s.cash + s.reserve >= 500000) unlock("warchest");
+        if (s.properties.length >= 3) unlock("empire");
+
+        s.market.forEach((d, idx) => {
+          d.ttl -= 1;
+          if (d.ttl <= 0) {
+            if (d.hot) { addLog(`🔥 "${d.name}" (${fmt(d.price)}) got sniped by another buyer — it moved fast.`, "warn"); unlock("sniped"); }
+            else addLog(`Listing "${d.name}" (${fmt(d.price)}) came off market — owner pulled it.`, "info");
+            const fresh = genDeal(s.treasury + 0.0275);
+            s.market[idx] = fresh;
+            addLog(`${fresh.hot ? "🔥 HOT LISTING" : "New listing"}: ${fresh.name} — ${fmt(fresh.price)}, ${(fresh.cap * 100).toFixed(1)}% cap, ${LEASE_TYPES[fresh.leaseTypeIdx].code} lease.`, fresh.hot ? "warn" : "info");
+          }
+        });
+        for (const d of s.market) d.rate = Math.max(0.03, s.treasury + 0.0275 + LEASE_TYPES[d.leaseTypeIdx].rateAdj + (DEAL_TYPES.find(t => t.name === d.name)?.typeRateAdj || 0));
+
+        const nw = s.cash + s.reserve + (s.escrow ? s.escrow.amount : 0) + s.properties.reduce((a, p) => a + p.value - p.loan.balance, 0);
+        if (!s.goalHit && nw >= GOAL) { s.goalHit = true; unlock("mogul"); addLog("🏆 $100,000,000 NET WORTH. Empire complete. (Keep playing!)", "ach"); }
+      }
+      s.log = [...logs.reverse(), ...s.log].slice(0, 70);
+      return s;
+    });
+  };
+
+  /* ---------- decisions / alerts ---------- */
+  const resolveDecision = (id) => {
+    setG((prev) => {
+      const s = JSON.parse(JSON.stringify(prev));
+      const mac = s.properties.find((p) => p.isMac);
+      const logs = [];
+      if (id === "kabobs-secure") { s.cash -= 15000; if (mac) mac.kabobs.secured = true; logs.push({ m: s.month, t: "Paid $15K TI — Kabobs extension locked through 2047.", k: "good" }); }
+      if (id === "kabobs-pass") logs.push({ m: s.month, t: "Passed on early renewal. Expiry roll of the dice comes Jul 2037.", k: "warn" });
+      s.queue.shift();
+      s.log = [...logs, ...s.log].slice(0, 70);
+      return s;
+    });
+  };
+  const acknowledgeAlert = () => setG((prev) => { const s = JSON.parse(JSON.stringify(prev)); s.queue.shift(); return s; });
+
+  const applyLump = (propId, amt) => {
+    setG((prev) => {
+      const s = JSON.parse(JSON.stringify(prev));
+      const p = s.properties.find((x) => x.id === propId);
+      if (!p || amt <= 0 || amt > s.cash || p.loan.balance <= 0) return prev;
+      const applied = Math.min(amt, p.loan.balance);
+      s.cash -= applied; p.loan.balance -= applied;
+      const logs = [{ m: s.month, t: `Extra principal ${fmt(applied)} → ${p.name}. Balance now ${fmt(p.loan.balance)}. Payment unchanged (re-amortizes only at a reset).`, k: "good" }];
+      if (!s.ach.includes("lump")) { s.ach.push("lump"); logs.push({ m: s.month, t: ACH_DEFS.lump, k: "ach" }); }
+      if (p.loan.balance === 0) { logs.push({ m: s.month, t: `${p.name} is FREE & CLEAR!`, k: "good" }); if (!s.ach.includes("freeclear")) { s.ach.push("freeclear"); logs.push({ m: s.month, t: ACH_DEFS.freeclear, k: "ach" }); } }
+      s.log = [...logs, ...s.log].slice(0, 70);
+      return s;
+    });
+    setModal(null); setLumpAmt("");
+  };
+
+  const transferReserve = (dir, amt) => {
+    setG((prev) => {
+      const s = JSON.parse(JSON.stringify(prev));
+      if (amt <= 0) return prev;
+      if (dir === "in") { if (amt > s.cash) return prev; s.cash -= amt; s.reserve += amt; s.log = [{ m: s.month, t: `Stowed ${fmt(amt)} into the reserve account.`, k: "info" }, ...s.log].slice(0, 70); }
+      else { if (amt > s.reserve) return prev; s.reserve -= amt; s.cash += amt; s.log = [{ m: s.month, t: `Pulled ${fmt(amt)} from reserve back to operating cash.`, k: "info" }, ...s.log].slice(0, 70); }
+      if (s.cash + s.reserve >= 500000 && !s.ach.includes("warchest")) { s.ach.push("warchest"); s.log = [{ m: s.month, t: ACH_DEFS.warchest, k: "ach" }, ...s.log].slice(0, 70); }
+      return s;
+    });
+    setResAmt("");
+  };
+
+  const sellProp = (propId, mode) => {
+    setG((prev) => {
+      const s = JSON.parse(JSON.stringify(prev));
+      const idx = s.properties.findIndex((x) => x.id === propId);
+      if (idx < 0) return prev;
+      const p = s.properties[idx];
+      const proceeds = p.value * 0.95 - p.loan.balance;
+      const gain = Math.max(0, p.value - p.basis);
+      const logs = [];
+      if (mode === "cash") { const tax = 0.25 * gain; s.cash += proceeds - tax; logs.push({ m: s.month, t: `Sold ${p.name} for ${fmt(p.value)}. Net after loan, 5% costs & ${fmt(tax)} tax: +${fmt(proceeds - tax)}.`, k: "good" }); }
+      else { s.escrow = { amount: (s.escrow ? s.escrow.amount : 0) + proceeds, gain: (s.escrow ? s.escrow.gain : 0) + gain, deadline: s.month + 6 }; logs.push({ m: s.month, t: `Sold ${p.name} via 1031. ${fmt(proceeds)} in exchange escrow — buy within 6 months or pay tax.`, k: "warn" }); }
+      s.properties.splice(idx, 1);
+      s.log = [...logs, ...s.log].slice(0, 70);
+      return s;
+    });
+    setModal(null);
+  };
+
+  // escrowOverride: how much of the 1031 escrow the player chooses to put into this deal.
+  // Can exceed the lender's minimum down payment — the surplus reduces the loan instead of sitting idle.
+  const buyDeal = (dealId, escrowOverride) => {
+    setG((prev) => {
+      const s = JSON.parse(JSON.stringify(prev));
+      const di = s.market.findIndex((d) => d.id === dealId);
+      if (di < 0) return prev;
+      const d = s.market[di];
+      const minDown = d.price * (1 - d.ltv), closing = d.price * 0.02;
+      const escrowAvail = s.escrow ? s.escrow.amount : 0;
+      const escrowUsed = Math.max(0, Math.min(escrowOverride ?? Math.min(escrowAvail, minDown), escrowAvail, d.price));
+      const effectiveDown = Math.max(minDown, escrowUsed);
+      const loanAmt = d.price - effectiveDown;
+      const fromCashForDown = Math.max(0, effectiveDown - escrowUsed);
+      const fromCash = fromCashForDown + closing;
+      if (fromCash > s.cash) return prev;
+      const logs = [];
+      s.cash -= fromCash;
+      if (escrowUsed > 0) {
+        s.escrow.amount -= escrowUsed;
+        if (s.escrow.amount < 1000) { logs.push({ m: s.month, t: "1031 exchange completed — capital gains deferred. Basis carries forward.", k: "good" }); if (!s.ach.includes("exchange")) { s.ach.push("exchange"); logs.push({ m: s.month, t: ACH_DEFS.exchange, k: "ach" }); } s.escrow = null; }
+      }
+      s.properties.push({
+        id: "p" + d.id, name: d.name, sub: d.sub, emoji: d.emoji, sqft: d.sqft, basis: d.price, value: d.price,
+        boughtMonth: s.month, tenantName: d.tenantName, tierIdx: d.tierIdx,
+        leaseMonthsLeft: d.leaseYearsLeft * 12, status: "occupied", darkUntil: null,
+        leaseTypeIdx: d.leaseTypeIdx, riskMult: d.riskMult, taxAnnual: d.taxAnnual, insAnnual: d.insAnnual,
+        grossRentBase: d.grossRentMo, landlordOpexBase: d.landlordOpexMo,
+        loan: { balance: loanAmt, originalAmount: loanAmt, rate: d.rate, originRate: d.rate, payment: pmtCalc(loanAmt, d.rate, d.amortYears), originMonth: s.month, amortYears: d.amortYears, resets: [], floor: 0, lender: "Market Debt" },
+      });
+      s.market[di] = genDeal(s.treasury + 0.0275);
+      const downPct = Math.round((effectiveDown / d.price) * 100);
+      logs.unshift({ m: s.month, t: `Acquired ${d.name} for ${fmt(d.price)} — ${fmt(effectiveDown)} down (${downPct}%${escrowUsed > 0 ? `, ${fmt(escrowUsed)} from 1031 escrow` : ""}) + ${fmt(closing)} closing, ${(d.rate * 100).toFixed(2)}% loan on ${fmt(loanAmt)}, ${LEASE_TYPES[d.leaseTypeIdx].code} lease. Tenant: ${d.tenantName} (${CREDIT_TIERS[d.tierIdx].tier}).`, k: "good" });
+      if (s.properties.length >= 3 && !s.ach.includes("empire")) { s.ach.push("empire"); logs.push({ m: s.month, t: ACH_DEFS.empire, k: "ach" }); }
+      s.log = [...logs, ...s.log].slice(0, 70);
+      return s;
+    });
+    setModal(null);
+  };
+
+  const refiRateFor = (p) => {
+    const base = g.treasury + 0.0275;
+    const leaseAdj = p.isMac ? 0 : LEASE_TYPES[p.leaseTypeIdx].rateAdj;
+    const typeAdj = DEAL_TYPES.find((t) => t.name === p.name)?.typeRateAdj || 0;
+    return Math.max(0.03, base + leaseAdj + typeAdj);
+  };
+
+  const doRefinance = (propId, newLoanAmt, newAmortYears, newRate) => {
+    setG((prev) => {
+      const s = JSON.parse(JSON.stringify(prev));
+      const p = s.properties.find((x) => x.id === propId);
+      if (!p) return prev;
+      const oldBalance = p.loan.balance;
+      const cashOut = newLoanAmt - oldBalance;
+      const fee = newLoanAmt * 0.01;
+      const netCash = cashOut - fee;
+      if (netCash < 0 && Math.abs(netCash) > s.cash) return prev;
+      s.cash += netCash;
+      const wasFloored = p.isMac && p.loan.floor > 0;
+      p.loan = {
+        balance: newLoanAmt, originalAmount: newLoanAmt, rate: newRate, originRate: newRate,
+        payment: pmtCalc(newLoanAmt, newRate, newAmortYears), originMonth: s.month,
+        amortYears: newAmortYears, resets: [], floor: 0, lender: "Refi Lender",
+      };
+      const logs = [];
+      let msg = `Refinanced ${p.name}: ${fmtFull(oldBalance)} balance → new ${fmtFull(newLoanAmt)} loan @ ${(newRate*100).toFixed(2)}%, ${newAmortYears}-yr am → ${fmt(p.loan.payment)}/mo. Fee ${fmtFull(fee)}.`;
+      if (cashOut > 0) msg += ` Cashed out ${fmtFull(cashOut)}.`;
+      if (wasFloored) msg += ` The old 6.75% rate floor is gone — this is a fresh note.`;
+      logs.push({ m: s.month, t: msg, k: "good" });
+      s.log = [...logs, ...s.log].slice(0, 70);
+      return s;
+    });
+    setModal(null);
+  };
+
+  const monthlyCF = useMemo(() => {
+    let cf = 0;
+    for (const p of g.properties) {
+      const { income, opex } = incomeOpexFor(p, g.month);
+      const ds = p.loan.balance > 0 ? p.loan.payment : 0;
+      cf += income - opex - ds;
+    }
+    return cf;
+  }, [g]);
+
+  const goalPct = Math.min(100, (netWorth / GOAL) * 100);
+  const top = g.queue[0];
+  const nwDisplay = useAnimatedNumber(netWorth);
+
+  /* ============ RENDER ============ */
+  return (
+    <div className="board-bg" style={{ background: C.felt, minHeight: "100vh", color: C.ink, fontFamily: "'Archivo', system-ui, sans-serif", position: "relative" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;800&family=IBM+Plex+Mono:wght@400;600&display=swap');
+        .disp { font-family: 'Big Shoulders Display', sans-serif; letter-spacing: 0.02em; }
+        .mono { font-family: 'IBM Plex Mono', monospace; }
+        .stampline { background-image: repeating-linear-gradient(90deg, ${C.line} 0 8px, transparent 8px 16px); height: 2px; }
+        .board-bg { background-image: radial-gradient(${C.line}55 1px, transparent 1px); background-size: 22px 22px; }
+        button { cursor: pointer; transition: transform .12s ease, filter .12s ease, box-shadow .12s ease; }
+        button:active { transform: scale(0.95); }
+        button:hover:not(:disabled) { filter: brightness(1.08); }
+        button:disabled { cursor: default; }
+        button:focus-visible { outline: 2px solid ${C.brass}; outline-offset: 2px; }
+        @keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes popIn { 0% { opacity: 0; transform: scale(0.7); } 70% { transform: scale(1.05); } 100% { opacity: 1; transform: scale(1); } }
+        @keyframes glowPulse { 0%,100% { box-shadow: 0 0 0 rgba(242,196,109,0); } 50% { box-shadow: 0 0 14px rgba(242,196,109,0.55); } }
+        @keyframes shimmerMove { 0% { transform: translateX(-120%); } 100% { transform: translateX(320%); } }
+        @keyframes confettiFall { 0% { transform: translateY(-10vh) rotate(0deg); opacity: 1; } 100% { transform: translateY(105vh) rotate(540deg); opacity: 0.9; } }
+        @keyframes toastIn { from { opacity: 0; transform: translateX(24px); } to { opacity: 1; transform: translateX(0); } }
+        @keyframes countGlow { 0%,100% { text-shadow: 0 0 0 rgba(217,164,65,0); } 50% { text-shadow: 0 0 18px rgba(217,164,65,0.7); } }
+        @keyframes splashIn { from { opacity: 0; transform: scale(0.85); } to { opacity: 1; transform: scale(1); } }
+        @keyframes bob { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+        .hot-pulse { animation: glowPulse 1.6s ease-in-out infinite; }
+        .card-enter { animation: fadeInUp .45s ease both; }
+        .goal-glow { animation: countGlow 1.8s ease-in-out infinite; }
+        .bob { animation: bob 2.6s ease-in-out infinite; }
+        @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+      `}</style>
+
+      {/* ===== TOASTS ===== */}
+      <div style={{ position: "fixed", top: 12, right: 12, zIndex: 80, display: "flex", flexDirection: "column", gap: 8 }}>
+        {toasts.map((t) => (
+          <div key={t.id} className="mono" style={{
+            animation: "toastIn .35s ease both", background: C.felt2, border: `1px solid ${C.gold}`, color: C.gold,
+            borderRadius: 8, padding: "10px 14px", fontSize: 12, boxShadow: "0 6px 20px rgba(0,0,0,0.4)", maxWidth: 280,
+          }}>
+            {t.text}
+          </div>
+        ))}
+      </div>
+
+      {/* ===== CONFETTI ===== */}
+      {confettiKey > 0 && <Confetti key={confettiKey} />}
+
+      {/* ===== SPLASH ===== */}
+      {!started && <Splash onStart={() => setStarted(true)} />}
+
+      {/* ===== GOAL CELEBRATION ===== */}
+      {showCelebration && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(6,12,9,0.88)", zIndex: 90 }} className="flex items-center justify-center p-4">
+          <div style={{ animation: "popIn .5s ease both", background: C.felt2, border: `2px solid ${C.gold}`, borderRadius: 16, padding: 32, textAlign: "center", maxWidth: 420 }}>
+            <div className="bob" style={{ fontSize: 56 }}>🏆</div>
+            <div className="disp font-extrabold text-3xl mt-2" style={{ color: C.gold }}>YOU'RE A MOGUL</div>
+            <div className="mono text-sm mt-2" style={{ color: C.ink }}>Net worth crossed $100,000,000 in {dateLabel(g.month)}.</div>
+            <div className="mono text-xs mt-1" style={{ color: C.inkDim }}>{g.properties.length} propert{g.properties.length===1?"y":"ies"} · {g.ach.length}/8 achievements</div>
+            <button onClick={() => setShowCelebration(false)} className="disp font-extrabold px-5 py-2 mt-4"
+              style={{ background: C.gold, color: "#1A1408", border: "none", borderRadius: 8 }}>
+              KEEP BUILDING ▸
+            </button>
+          </div>
+        </div>
+      )}
+
+
+      {/* ===== HEADER ===== */}
+      <div style={{ borderBottom: `1px solid ${C.line}`, background: C.felt2, position: "sticky", top: 0, zIndex: 30 }}>
+        <div className="max-w-5xl mx-auto px-4 py-3">
+          <div className="flex items-baseline justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-2">
+              <MogulMark />
+              <div>
+                <div className="disp text-2xl md:text-3xl font-extrabold" style={{ color: C.brass, lineHeight: 1 }}>RE MOGUL</div>
+                <div className="mono text-xs" style={{ color: C.inkDim }}>MacArthur Holdings & Co. · <span key={g.month} style={{ display: "inline-block", animation: "fadeInUp .3s ease both" }}>{dateLabel(g.month)}</span> · 5Y UST {(g.treasury * 100).toFixed(2)}%</div>
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="mono text-xs" style={{ color: C.inkDim }}>NET WORTH</div>
+              <div className={`disp text-2xl md:text-3xl font-extrabold ${g.goalHit ? "goal-glow" : ""}`} style={{ color: g.goalHit ? C.gold : C.ink }}>{fmt(nwDisplay)}</div>
+            </div>
+          </div>
+
+
+          <div className="mt-2" style={{ background: C.felt3, borderRadius: 4, height: 8, overflow: "hidden", position: "relative" }}>
+            <div style={{ width: goalPct + "%", height: "100%", background: g.goalHit ? `linear-gradient(90deg, ${C.brassDim}, ${C.gold})` : C.sprout, transition: "width .6s ease" }} />
+            <div style={{ position: "absolute", top: 0, left: 0, width: "35%", height: "100%", background: "linear-gradient(90deg, transparent, rgba(255,255,255,0.25), transparent)", animation: "shimmerMove 2.6s linear infinite" }} />
+          </div>
+          <div className="mono text-xs mt-1 flex justify-between" style={{ color: C.inkDim }}>
+            <span>GOAL: $100M NET WORTH</span><span>{goalPct.toFixed(2)}%</span>
+          </div>
+
+          <div className="flex flex-wrap gap-4 mt-3 items-center">
+            <Stat label="CASH" val={fmt(g.cash)} color={g.cash < 0 ? C.flare : C.sprout} />
+            <Stat label="RESERVE" val={fmt(g.reserve)} color={C.gold} />
+            <Stat label="MONTHLY CF" val={(monthlyCF >= 0 ? "+" : "") + fmt(monthlyCF)} color={monthlyCF >= 0 ? C.sprout : C.flare} />
+            {g.escrow && <Stat label={`1031 ESCROW · ${Math.max(0, g.escrow.deadline - g.month)}mo left`} val={fmt(g.escrow.amount)} color={C.brass} />}
+            <button onClick={() => { setModal({ type: "reserve" }); setResAmt(""); }}
+              className="mono text-xs px-3 py-1.5" style={{ background: C.felt3, color: C.gold, border: `1px solid ${C.gold}`, borderRadius: 6 }}>
+              🏦 MANAGE RESERVE
+            </button>
+            <button onClick={newGame} className="mono text-xs px-3 py-1.5" style={{ background: C.felt3, color: C.inkDim, border: `1px solid ${C.line}`, borderRadius: 6 }}>
+              🔄 NEW GAME
+            </button>
+            {lastSaved && <span className="mono" style={{ fontSize: 10, color: "#6E7C6C" }}>💾 saved to this device</span>}
+            <div className="flex gap-2 ml-auto">
+              {[1, 6, 12].map((n) => (
+                <button key={n} onClick={() => runMonths(n)} disabled={g.queue.length > 0}
+                  className="disp font-extrabold px-3 py-2 text-sm md:text-base"
+                  style={{ background: g.queue.length > 0 ? C.felt3 : C.brass, color: g.queue.length > 0 ? C.inkDim : "#1A1408", borderRadius: 6, border: "none", opacity: g.queue.length > 0 ? 0.6 : 1 }}>
+                  ADVANCE +{n}MO ▸
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ===== QUEUE BANNER ===== */}
+      {top && (
+        <div className="max-w-5xl mx-auto px-4 mt-4">
+          <div style={{ background: C.felt2, border: `2px solid ${top.kind === "alert" ? C.flare : C.brass}`, borderRadius: 10, padding: 16 }}>
+            <div className="flex items-center justify-between">
+              <div className="disp text-xl font-extrabold" style={{ color: top.kind === "alert" ? C.flare : C.brass }}>{top.title}</div>
+              {g.queue.length > 1 && <div className="mono text-xs px-2 py-1" style={{ background: C.felt3, borderRadius: 4, color: C.inkDim }}>+{g.queue.length - 1} more waiting</div>}
+            </div>
+            <div className="text-sm mt-1" style={{ color: C.ink }}>{top.body}</div>
+            <div className="flex gap-2 mt-3 flex-wrap">
+              {top.kind === "decision"
+                ? top.options.map((o) => (
+                    <button key={o.id} onClick={() => resolveDecision(o.id)} className="mono text-sm px-3 py-2" style={{ background: C.felt3, color: C.ink, border: `1px solid ${C.brass}`, borderRadius: 6 }}>{o.label}</button>
+                  ))
+                : <button onClick={acknowledgeAlert} className="mono text-sm px-3 py-2" style={{ background: C.felt3, color: C.flare, border: `1px solid ${C.flare}`, borderRadius: 6 }}>Acknowledge ▸</button>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ===== BODY ===== */}
+      <div className="max-w-5xl mx-auto px-4 py-5 grid grid-cols-1 lg:grid-cols-3 gap-5">
+        <div className="lg:col-span-2 flex flex-col gap-5">
+          <div>
+            <SectionHead label={`PORTFOLIO · ${g.properties.length} DEED${g.properties.length === 1 ? "" : "S"}`} />
+            <div className="flex flex-col gap-3 mt-2">
+              {g.properties.map((p, i) => (
+                <div key={p.id} className="card-enter" style={{ animationDelay: `${i * 60}ms` }}>
+                  <PropertyCard p={p} month={g.month}
+                    onLoan={() => setModal({ type: "loan", propId: p.id })}
+                    onRefi={() => setModal({ type: "refi", propId: p.id })}
+                    onLump={() => { setModal({ type: "lump", propId: p.id }); setLumpAmt(""); }}
+                    onSell={() => setModal({ type: "sell", propId: p.id })} />
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <SectionHead label={`ON THE MARKET · DEBT AT ${(marketRate * 100).toFixed(2)}% (BASE)`} />
+            <div className="mono text-xs mt-1 mb-1" style={{ color: C.inkDim }}>
+              🔥 marked listings move fast · loan rate & leverage shift with lease type and property risk
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 mt-2">
+              {g.market.map((d, i) => (
+                <div key={d.id} className="card-enter" style={{ animationDelay: `${i * 50}ms` }}>
+                  <DealCard d={d} cash={g.cash} escrow={g.escrow}
+                    onView={() => {
+                      const minDown = d.price * (1 - d.ltv);
+                      const defaultEscrow = g.escrow ? Math.min(g.escrow.amount, minDown) : 0;
+                      setEscrowInput(String(Math.round(defaultEscrow)));
+                      setModal({ type: "buy", dealId: d.id });
+                    }} />
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+
+        <div className="flex flex-col gap-5">
+          <div>
+            <SectionHead label="THE LEDGER" />
+            <div ref={logRef} className="mt-2 flex flex-col gap-1 overflow-y-auto pr-1" style={{ maxHeight: 420 }}>
+              {g.log.map((l, i) => (
+                <div key={i} className="mono text-xs px-2 py-1.5" style={{
+                  background: C.felt2, borderRadius: 4,
+                  borderLeft: `3px solid ${l.k === "good" ? C.sprout : l.k === "bad" ? C.flare : l.k === "warn" ? C.brass : l.k === "ach" ? C.brass : C.line}`,
+                  color: l.k === "ach" ? C.brass : C.ink,
+                }}>
+                  <span style={{ color: C.inkDim }}>{dateLabel(l.m)} · </span>{l.t}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {g.ach.length > 0 && (
+            <div>
+              <SectionHead label={`ACHIEVEMENTS · ${g.ach.length}/8`} />
+              <div className="mt-2 flex flex-col gap-1">
+                {g.ach.map((a) => (
+                  <div key={a} className="mono text-xs px-2 py-1.5" style={{ background: C.felt2, borderRadius: 4, color: C.brass }}>{ACH_DEFS[a]}</div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ===== MODALS ===== */}
+      {modal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(6,12,9,0.75)", zIndex: 50 }} className="flex items-center justify-center p-4" onClick={() => setModal(null)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: C.felt2, border: `1px solid ${C.brass}`, borderRadius: 12, maxWidth: 500, width: "100%", padding: 20, maxHeight: "88vh", overflowY: "auto" }}>
+            {modal.type === "loan" && <LoanModal g={g} modal={modal} close={() => setModal(null)} />}
+            {modal.type === "refi" && <RefiModal g={g} modal={modal} refiRateFor={refiRateFor} doRefinance={doRefinance} close={() => setModal(null)} />}
+            {modal.type === "lump" && <LumpModal g={g} modal={modal} lumpAmt={lumpAmt} setLumpAmt={setLumpAmt} applyLump={applyLump} close={() => setModal(null)} />}
+            {modal.type === "sell" && <SellModal g={g} modal={modal} sellProp={sellProp} close={() => setModal(null)} />}
+            {modal.type === "buy" && <OMModal g={g} modal={modal} buyDeal={buyDeal} escrowInput={escrowInput} setEscrowInput={setEscrowInput} close={() => setModal(null)} />}
+            {modal.type === "reserve" && <ReserveModal g={g} resAmt={resAmt} setResAmt={setResAmt} transferReserve={transferReserve} close={() => setModal(null)} />}
+          </div>
+        </div>
+      )}
+
+      <div className="max-w-5xl mx-auto px-4 pb-8 mono text-xs" style={{ color: C.inkDim }}>
+        Seeded with your real deal: $1.7M @ 6.75% (floor 6.75% on resets · Mar 2031/2036/2041), 7-Eleven steps Oct 2034 &amp; Oct 2039, Kabobs expiry Jul 2037. Every acquired property carries its own tax/insurance/CAM load, lease structure, and lender pricing based on type and value. Progress autosaves to this device — use New Game to start fresh.
+      </div>
+    </div>
+  );
+}
+
+/* ============ SUBCOMPONENTS ============ */
+function MogulMark() {
+  return (
+    <svg width="34" height="34" viewBox="0 0 40 40" className="bob">
+      <rect x="4" y="18" width="9" height="18" fill={C.brassDim} rx="1" />
+      <rect x="15" y="10" width="10" height="26" fill={C.brass} rx="1" />
+      <rect x="27" y="14" width="9" height="22" fill={C.gold} rx="1" />
+      <rect x="2" y="35" width="36" height="2.5" fill={C.line} rx="1" />
+      <circle cx="20" cy="6" r="3.2" fill={C.gold} />
+    </svg>
+  );
+}
+
+function Splash({ onStart }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: `radial-gradient(circle at 50% 30%, ${C.felt3}, ${C.felt})`, zIndex: 100 }}
+      className="board-bg flex items-center justify-center p-4">
+      <div style={{ animation: "splashIn .6s ease both", textAlign: "center", maxWidth: 440 }}>
+        <div className="flex justify-center mb-3"><div style={{ transform: "scale(2.6)" }}><MogulMark /></div></div>
+        <div className="disp font-extrabold" style={{ color: C.brass, fontSize: 52, lineHeight: 1, letterSpacing: "0.03em" }}>RE MOGUL</div>
+        <div className="mono text-sm mt-3" style={{ color: C.inkDim }}>
+          Start with one property, $30K, and a dream. Build toward a $100,000,000 empire —
+          pay down debt, ride out vacancies, chase hot deals, and don't miss a rate reset.
+        </div>
+        <button onClick={onStart} className="disp font-extrabold px-8 py-3 mt-6" style={{ background: C.brass, color: "#1A1408", border: "none", borderRadius: 8, fontSize: 18 }}>
+          START THE EMPIRE ▸
+        </button>
+        <div className="mono text-xs mt-3" style={{ color: "#6E7C6C" }}>Seeded with a real Irving, TX deal · 7-Eleven + Kabobs To Go</div>
+      </div>
+    </div>
+  );
+}
+
+function Confetti() {
+  const colors = [C.brass, C.gold, C.sprout, C.flare, "#8FC7D9", C.ink];
+  const pieces = useMemo(() => Array.from({ length: 60 }, (_, i) => ({
+    id: i, left: Math.random() * 100, delay: Math.random() * 0.6, dur: 2 + Math.random() * 1.4,
+    size: 5 + Math.random() * 6, color: colors[i % colors.length], rot: Math.random() * 360,
+  })), []); // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 95, pointerEvents: "none", overflow: "hidden" }}>
+      {pieces.map((c) => (
+        <div key={c.id} style={{
+          position: "absolute", left: c.left + "%", top: "-5vh", width: c.size, height: c.size * 0.6,
+          background: c.color, opacity: 0.9, transform: `rotate(${c.rot}deg)`,
+          animation: `confettiFall ${c.dur}s ease-in ${c.delay}s forwards`,
+        }} />
+      ))}
+    </div>
+  );
+}
+
+function Stat({ label, val, color }) {
+  return (<div><div className="mono" style={{ fontSize: 10, color: C.inkDim }}>{label}</div><div className="mono font-semibold text-base" style={{ color }}>{val}</div></div>);
+}
+function SectionHead({ label }) {
+  return (<div><div className="disp font-extrabold text-lg" style={{ color: C.ink }}>{label}</div><div className="stampline mt-1" /></div>);
+}
+function TierBadge({ tierIdx, compact }) {
+  const t = CREDIT_TIERS[tierIdx];
+  return (<span className="mono" style={{ fontSize: compact ? 9 : 10, color: t.color, border: `1px solid ${t.color}`, borderRadius: 4, padding: compact ? "1px 5px" : "2px 6px", whiteSpace: "nowrap" }}>{t.tier.toUpperCase()}</span>);
+}
+function LeaseBadge({ leaseTypeIdx, compact }) {
+  const l = LEASE_TYPES[leaseTypeIdx];
+  return (<span className="mono" style={{ fontSize: compact ? 9 : 10, color: C.inkDim, border: `1px solid ${C.line}`, borderRadius: 4, padding: compact ? "1px 5px" : "2px 6px", whiteSpace: "nowrap" }}>{l.code}</span>);
+}
+
+function PropertyCard({ p, month, onLoan, onRefi, onLump, onSell }) {
+  const eq = p.value - p.loan.balance;
+  const eqPct = Math.max(0, Math.min(100, (eq / p.value) * 100));
+  const free = p.loan.balance <= 0;
+  const isDark = p.isMac ? p.kabobs.status === "dark" : p.status === "dark";
+  const { income, opex } = incomeOpexFor(p, month);
+  return (
+    <div style={{ background: C.felt2, border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden", transition: "transform .15s ease, box-shadow .15s ease" }}
+      onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-2px)"; e.currentTarget.style.boxShadow = "0 8px 20px rgba(0,0,0,0.3)"; }}
+      onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "none"; }}>
+      <div className="flex items-center justify-between px-4 py-2" style={{ background: C.felt3, borderBottom: `1px solid ${C.line}` }}>
+        <div className="disp font-extrabold text-lg" style={{ color: C.brass }}>{p.emoji} {p.name}</div>
+        <div className="mono text-xs" style={{ color: C.inkDim }}>DEED № {p.id.toUpperCase()}</div>
+      </div>
+      <div className="px-4 py-3">
+        <div className="flex items-center justify-between mb-2 flex-wrap gap-1">
+          <div className="mono text-xs" style={{ color: C.inkDim }}>{p.sub}{p.sqft ? ` · ${p.sqft.toLocaleString()} SF` : ""}</div>
+          <div className="flex gap-1">
+            {p.isMac ? <span className="mono" style={{ fontSize: 9, color: C.inkDim, border: `1px solid ${C.line}`, borderRadius: 4, padding: "1px 5px" }}>MIXED LEASE</span> : <LeaseBadge leaseTypeIdx={p.leaseTypeIdx} compact />}
+            {!p.isMac && <TierBadge tierIdx={p.tierIdx} compact />}
+          </div>
+        </div>
+        {!p.isMac && (
+          <div className="mono text-xs mb-2" style={{ color: C.inkDim }}>
+            Tenant: <span style={{ color: C.ink }}>{p.tenantName}</span>
+            {p.status === "occupied" && <span> · {Math.max(0, Math.ceil(p.leaseMonthsLeft / 12))}yr lease left</span>}
+          </div>
+        )}
+        <div className="grid grid-cols-3 gap-3 mono text-sm">
+          <div><div style={{ fontSize: 10, color: C.inkDim }}>VALUE</div><div style={{ color: C.ink }}>{fmt(p.value)}</div></div>
+          <div><div style={{ fontSize: 10, color: C.inkDim }}>LOAN {free ? "" : `@ ${(p.loan.rate * 100).toFixed(2)}%`}</div><div style={{ color: free ? C.sprout : C.ink }}>{free ? "FREE & CLEAR" : fmt(p.loan.balance)}</div></div>
+          <div><div style={{ fontSize: 10, color: C.inkDim }}>EQUITY</div><div style={{ color: C.sprout }}>{fmt(eq)}</div></div>
+        </div>
+        <div className="mono text-xs mt-2 flex gap-3" style={{ color: C.inkDim }}>
+          <span>Income {fmt(income)}/mo</span><span>Landlord opex {fmt(opex)}/mo</span>
+        </div>
+        <div className="mt-2" style={{ background: C.felt, borderRadius: 4, height: 10, overflow: "hidden", border: `1px solid ${C.line}` }}>
+          <div style={{ width: eqPct + "%", height: "100%", background: `linear-gradient(90deg, ${C.brassDim}, ${C.brass})`, transition: "width .5s" }} />
+        </div>
+        <div className="mono flex justify-between mt-1" style={{ fontSize: 10, color: C.inkDim }}>
+          <span>{eqPct.toFixed(0)}% EQUITY</span>
+          {!free && <span>{fmt(p.loan.payment)}/mo debt service</span>}
+        </div>
+        {isDark && (
+          <div className="mono text-xs mt-2 px-2 py-1" style={{ background: "#3A1F18", color: C.flare, borderRadius: 4 }}>
+            ⚠ Suite DARK — re-lease est. {dateLabel(p.isMac ? p.kabobs.darkUntil : p.darkUntil)}
+          </div>
+        )}
+        <div className="flex gap-2 mt-3 flex-wrap">
+          <button onClick={onLoan} className="mono text-xs px-3 py-1.5" style={{ background: C.felt3, color: C.gold, border: `1px solid ${C.gold}`, borderRadius: 6 }}>🔍 VIEW LOAN</button>
+          <button onClick={onRefi} className="mono text-xs px-3 py-1.5" style={{ background: C.felt3, color: "#8FC7D9", border: `1px solid #8FC7D9`, borderRadius: 6 }}>🔁 REFINANCE</button>
+          {!free && <button onClick={onLump} className="mono text-xs px-3 py-1.5" style={{ background: C.felt3, color: C.brass, border: `1px solid ${C.brass}`, borderRadius: 6 }}>💰 PAY DOWN LOAN</button>}
+          <button onClick={onSell} className="mono text-xs px-3 py-1.5" style={{ background: C.felt3, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 6 }}>🏷️ SELL</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DealCard({ d, cash, escrow, onView }) {
+  const minDown = d.price * (1 - d.ltv);
+  const closing = d.price * 0.02;
+  const escrowAvail = escrow ? escrow.amount : 0;
+  // minimum cash needed assumes escrow covers as much of the down payment as it can
+  const minCashNeeded = Math.max(0, minDown - escrowAvail) + closing;
+  const can = cash >= minCashNeeded;
+  return (
+    <div className={d.hot ? "hot-pulse" : ""} style={{ background: C.felt2, border: `1px solid ${d.hot ? C.gold : C.line}`, borderRadius: 10, padding: 12, position: "relative", transition: "transform .15s ease" }}
+      onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(-2px)")}
+      onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0)")}>
+      {d.hot && (
+        <div className="mono bob" style={{ position: "absolute", top: -9, right: 10, background: C.gold, color: "#1A1408", fontSize: 9, fontWeight: 700, padding: "2px 6px", borderRadius: 4 }}>
+          🔥 HOT · {d.ttl}MO LEFT
+        </div>
+      )}
+      <div className="flex items-start justify-between gap-2">
+        <div className="disp font-extrabold" style={{ color: C.ink }}>{d.emoji} {d.name}</div>
+        <div className="flex gap-1"><LeaseBadge leaseTypeIdx={d.leaseTypeIdx} compact /><TierBadge tierIdx={d.tierIdx} compact /></div>
+      </div>
+      <div className="mono" style={{ fontSize: 10, color: C.inkDim }}>{d.sub} · {d.sqft.toLocaleString()} SF</div>
+      <div className="mono text-sm mt-2" style={{ color: C.brass }}>{fmt(d.price)}</div>
+      <div className="mono" style={{ fontSize: 11, color: C.inkDim }}>{(d.cap * 100).toFixed(1)}% cap · {fmt(d.noiMo)}/mo NOI</div>
+      <div className="mono" style={{ fontSize: 11, color: C.inkDim }}>Tenant: {d.tenantName}</div>
+      <div className="mono" style={{ fontSize: 11, color: C.inkDim }}>{d.leaseYearsLeft}yr lease · {Math.round(d.ltv*100)}% LTV · Min cash {fmt(minCashNeeded)}</div>
+      {!d.hot && <div className="mono" style={{ fontSize: 10, color: "#6E7C6C" }}>On market ~{d.ttl}mo more</div>}
+      <button onClick={onView} className="mono text-xs w-full mt-2 px-2 py-1.5" style={{ background: can ? C.brass : C.felt3, color: can ? "#1A1408" : C.inkDim, border: can ? "none" : `1px solid ${C.line}`, borderRadius: 6 }}>
+        {can ? "VIEW OFFERING MEMO ▸" : "VIEW MEMO (CAN'T AFFORD YET)"}
+      </button>
+    </div>
+  );
+}
+
+function LoanModal({ g, modal, close }) {
+  const p = g.properties.find((x) => x.id === modal.propId);
+  if (!p) return null;
+  const L = p.loan;
+  const free = L.balance <= 0;
+  const { income, opex } = incomeOpexFor(p, g.month);
+  const noiAnnual = (income - opex) * 12;
+  const dscr = L.payment > 0 ? noiAnnual / (L.payment * 12) : Infinity;
+  const ltv = p.value > 0 ? L.balance / p.value : 0;
+  const paidPct = L.originalAmount ? (1 - L.balance / L.originalAmount) * 100 : 0;
+  const yearsLeft = !free && L.payment > (L.balance * L.rate) / 12
+    ? Math.log(L.payment / (L.payment - (L.balance * L.rate) / 12)) / Math.log(1 + L.rate / 12) / 12 : 0;
+  const payoffMonth = g.month + Math.round(yearsLeft * 12);
+  const elapsedYears = (g.month - L.originMonth) / 12;
+  const nextReset = p.isMac ? L.resets.find((r) => r > g.month) : null;
+  const dscrColor = dscr >= 1.25 ? C.sprout : dscr >= 1.10 ? C.gold : C.flare;
+  return (
+    <div>
+      <div className="mono text-xs" style={{ color: C.inkDim, letterSpacing: "0.08em" }}>LOAN MONITOR</div>
+      <div className="disp text-2xl font-extrabold mt-1" style={{ color: C.brass }}>{p.emoji} {p.name}</div>
+      <div className="mono text-xs" style={{ color: C.inkDim }}>{L.lender}{p.isMac ? "" : " · Market Debt"}</div>
+
+      <div className="mt-3" style={{ background: C.felt3, borderRadius: 8, padding: 12 }}>
+        <div className="flex justify-between mono text-xs" style={{ color: C.inkDim }}>
+          <span>PAID DOWN</span><span>{paidPct.toFixed(1)}% of original</span>
+        </div>
+        <div className="mt-1" style={{ background: C.felt, borderRadius: 4, height: 10, overflow: "hidden", border: `1px solid ${C.line}` }}>
+          <div style={{ width: Math.min(100, Math.max(0, paidPct)) + "%", height: "100%", background: `linear-gradient(90deg, ${C.brassDim}, ${C.gold})` }} />
+        </div>
+        <div className="mono text-xs mt-2 flex justify-between" style={{ color: C.ink }}><span>Original loan</span><span>{fmtFull(L.originalAmount || L.balance)}</span></div>
+        <div className="mono text-xs flex justify-between" style={{ color: C.ink }}><span>Current balance</span><span style={{ color: free ? C.sprout : C.ink }}>{free ? "PAID OFF" : fmtFull(L.balance)}</span></div>
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-3 mono text-xs" style={{ color: C.ink }}>
+        <div><span style={{ color: C.inkDim }}>Rate</span><br />{(L.rate * 100).toFixed(2)}%{L.originRate && L.originRate !== L.rate ? ` (orig. ${(L.originRate*100).toFixed(2)}%)` : ""}</div>
+        <div><span style={{ color: C.inkDim }}>Monthly payment</span><br />{free ? "$0" : fmt(L.payment)}</div>
+        <div><span style={{ color: C.inkDim }}>LTV now</span><br />{(ltv * 100).toFixed(0)}%</div>
+        <div><span style={{ color: C.inkDim }}>DSCR (NOI / debt svc)</span><br /><span style={{ color: dscrColor }}>{isFinite(dscr) ? dscr.toFixed(2) + "x" : "—"}</span></div>
+        <div><span style={{ color: C.inkDim }}>Amortization</span><br />{L.amortYears} yrs</div>
+        <div><span style={{ color: C.inkDim }}>Years held</span><br />{elapsedYears.toFixed(1)} yrs</div>
+        <div><span style={{ color: C.inkDim }}>Est. years to payoff</span><br />{free ? "—" : yearsLeft.toFixed(1) + " yrs"}</div>
+        <div><span style={{ color: C.inkDim }}>Est. payoff date</span><br />{free ? "Paid off" : dateLabel(payoffMonth)}</div>
+      </div>
+
+      {p.isMac && (
+        <div className="mt-3" style={{ background: C.felt, borderRadius: 8, padding: 12, border: `1px solid ${C.line}` }}>
+          <div className="mono text-xs" style={{ color: C.inkDim, marginBottom: 4 }}>RATE RESET SCHEDULE</div>
+          <div className="mono text-xs" style={{ color: C.ink }}>Floor: {(L.floor * 100).toFixed(2)}% — resets can never go lower.</div>
+          <div className="mono text-xs mt-1" style={{ color: C.ink }}>
+            {nextReset ? `Next reset: ${dateLabel(nextReset)}` : "No resets remaining."}
+          </div>
+        </div>
+      )}
+      {!p.isMac && !free && (
+        <div className="mt-3 mono text-xs" style={{ color: C.inkDim }}>
+          Fixed-rate market debt — no scheduled resets. Use Refinance to reset the rate/term or pull cash out.
+        </div>
+      )}
+      {dscr < 1.10 && !free && (
+        <div className="mono text-xs mt-3 px-2 py-1.5" style={{ background: "#3A1F18", color: C.flare, borderRadius: 4 }}>
+          ⚠ DSCR below 1.10x — this property is barely covering its own debt service. Vacancy or another rate move could push it negative.
+        </div>
+      )}
+
+      <button onClick={close} className="mono text-sm px-3 py-2 mt-4 w-full" style={{ background: C.felt3, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 6 }}>Close</button>
+    </div>
+  );
+}
+
+function RefiModal({ g, modal, refiRateFor, doRefinance, close }) {
+  const p = g.properties.find((x) => x.id === modal.propId);
+  if (!p) return null;
+  const [amortYears, setAmortYears] = useState(p.loan.amortYears || 25);
+  const [loanInput, setLoanInput] = useState(String(Math.round(p.loan.balance)));
+
+  const newRate = refiRateFor(p);
+  const maxLoan = p.value * 0.70;
+  const newLoanAmt = Math.max(0, Math.min(Number(loanInput) || 0, maxLoan));
+  const oldBalance = p.loan.balance;
+  const cashOut = newLoanAmt - oldBalance;
+  const fee = newLoanAmt * 0.01;
+  const netCash = cashOut - fee;
+  const newPayment = pmtCalc(newLoanAmt, newRate, amortYears);
+  const affordable = netCash >= 0 || Math.abs(netCash) <= g.cash;
+  const wasFloored = p.isMac && p.loan.floor > 0;
+  const rateImprovement = p.loan.rate - newRate;
+
+  return (
+    <div>
+      <div className="mono text-xs" style={{ color: C.inkDim, letterSpacing: "0.08em" }}>REFINANCE</div>
+      <div className="disp text-2xl font-extrabold mt-1" style={{ color: "#8FC7D9" }}>🔁 {p.name}</div>
+      {wasFloored && (
+        <div className="mono text-xs mt-2 px-2 py-1.5" style={{ background: C.felt3, color: C.gold, borderRadius: 4 }}>
+          This loan's rate can never reset below {(p.loan.floor * 100).toFixed(2)}%. Refinancing replaces it with a fresh note — the floor goes away entirely.
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 gap-3 mt-3 mono text-sm">
+        <div style={{ background: C.felt3, borderRadius: 8, padding: 10 }}>
+          <div style={{ fontSize: 10, color: C.inkDim }}>CURRENT</div>
+          <div style={{ color: C.ink }}>{(p.loan.rate * 100).toFixed(2)}% · {fmt(p.loan.payment)}/mo</div>
+          <div className="mono" style={{ fontSize: 10, color: C.inkDim }}>Balance {fmtFull(oldBalance)}</div>
+        </div>
+        <div style={{ background: C.felt3, borderRadius: 8, padding: 10 }}>
+          <div style={{ fontSize: 10, color: C.inkDim }}>TODAY'S MARKET RATE</div>
+          <div style={{ color: rateImprovement > 0 ? C.sprout : C.flare }}>{(newRate * 100).toFixed(2)}%</div>
+          <div className="mono" style={{ fontSize: 10, color: C.inkDim }}>{rateImprovement > 0 ? `${(rateImprovement*100).toFixed(2)}pt better` : rateImprovement < 0 ? `${(Math.abs(rateImprovement)*100).toFixed(2)}pt worse` : "unchanged"}</div>
+        </div>
+      </div>
+
+      <div className="mono text-xs mt-3" style={{ color: C.inkDim }}>NEW LOAN AMOUNT · max {fmt(maxLoan)} (70% of value)</div>
+      <div className="flex gap-2 mt-1 flex-wrap">
+        <button onClick={() => setLoanInput(String(Math.round(oldBalance)))} className="mono text-xs px-2 py-1" style={{ background: C.felt3, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 4 }}>Same balance ({fmt(oldBalance)})</button>
+        <button onClick={() => setLoanInput(String(Math.round(maxLoan)))} className="mono text-xs px-2 py-1" style={{ background: C.felt3, color: C.gold, border: `1px solid ${C.gold}`, borderRadius: 4 }}>Max cash-out ({fmt(maxLoan)})</button>
+        <button onClick={() => setLoanInput("0")} className="mono text-xs px-2 py-1" style={{ background: C.felt3, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 4 }}>Pay off (0)</button>
+      </div>
+      <input type="number" value={loanInput} onChange={(e) => setLoanInput(e.target.value)} className="mono w-full mt-2 px-3 py-2" style={{ background: C.felt, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 6 }} />
+
+      <div className="mono text-xs mt-3" style={{ color: C.inkDim }}>AMORTIZATION</div>
+      <div className="flex gap-2 mt-1">
+        {[15, 20, 25, 30].map((y) => (
+          <button key={y} onClick={() => setAmortYears(y)} className="mono text-xs px-3 py-1.5"
+            style={{ background: amortYears === y ? "#8FC7D9" : C.felt3, color: amortYears === y ? "#1A1408" : C.ink, border: `1px solid ${amortYears === y ? "#8FC7D9" : C.line}`, borderRadius: 4 }}>
+            {y}yr
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-3" style={{ background: C.felt, borderRadius: 8, padding: 12, border: `1px solid ${C.line}` }}>
+        <div className="mono text-xs flex flex-col gap-1" style={{ color: C.ink }}>
+          <div>New payment: <b>{fmt(newPayment)}/mo</b> (was {fmt(p.loan.payment)}/mo)</div>
+          <div>Refi fee (1% of new loan): −{fmtFull(fee)}</div>
+          {cashOut > 0
+            ? <div style={{ color: C.sprout }}>Cash out at closing: +{fmtFull(cashOut)} (net of fee: {fmtFull(netCash)})</div>
+            : <div style={{ color: C.inkDim }}>Cash needed to close: {fmtFull(Math.abs(netCash))}</div>}
+        </div>
+      </div>
+
+      <div className="flex gap-2 mt-4">
+        <button onClick={() => doRefinance(p.id, newLoanAmt, amortYears, newRate)} disabled={!affordable}
+          className="disp font-extrabold px-4 py-2" style={{ background: affordable ? "#8FC7D9" : C.felt3, color: affordable ? "#1A1408" : C.inkDim, border: "none", borderRadius: 6 }}>
+          CLOSE THE REFI
+        </button>
+        <button onClick={close} className="mono text-sm px-3 py-2" style={{ background: C.felt3, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 6 }}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+function LumpModal({ g, modal, lumpAmt, setLumpAmt, applyLump, close }) {
+  const p = g.properties.find((x) => x.id === modal.propId);
+  if (!p) return null;
+  const amt = Number(lumpAmt) || 0;
+  const max = Math.min(g.cash, p.loan.balance);
+  const yearsLeft = p.loan.balance > 0 ? Math.log(p.loan.payment / (p.loan.payment - (p.loan.balance * p.loan.rate) / 12)) / Math.log(1 + p.loan.rate / 12) / 12 : 0;
+  const newBal = Math.max(0, p.loan.balance - amt);
+  const newYears = newBal > 0 && p.loan.payment > (newBal * p.loan.rate) / 12 ? Math.log(p.loan.payment / (p.loan.payment - (newBal * p.loan.rate) / 12)) / Math.log(1 + p.loan.rate / 12) / 12 : 0;
+  return (
+    <div>
+      <div className="disp text-xl font-extrabold" style={{ color: C.brass }}>💰 Extra Principal — {p.name}</div>
+      <div className="mono text-xs mt-1" style={{ color: C.inkDim }}>Balance {fmtFull(p.loan.balance)} @ {(p.loan.rate * 100).toFixed(2)}% · ~{yearsLeft.toFixed(1)} yrs left at current payment</div>
+      <div className="flex gap-2 mt-3 flex-wrap">
+        {[50000, 100000, 200000].map((q) => (
+          <button key={q} onClick={() => setLumpAmt(String(Math.min(q, max)))} className="mono text-xs px-2 py-1" style={{ background: C.felt3, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 4 }}>{fmt(q)}</button>
+        ))}
+        <button onClick={() => setLumpAmt(String(Math.floor(max)))} className="mono text-xs px-2 py-1" style={{ background: C.felt3, color: C.brass, border: `1px solid ${C.brass}`, borderRadius: 4 }}>MAX {fmt(max)}</button>
+      </div>
+      <input type="number" value={lumpAmt} onChange={(e) => setLumpAmt(e.target.value)} placeholder="Amount" className="mono w-full mt-3 px-3 py-2" style={{ background: C.felt, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 6 }} />
+      {amt > 0 && amt <= max && (
+        <div className="mono text-xs mt-2" style={{ color: C.sprout }}>
+          → New balance {fmtFull(newBal)}{newBal > 0 ? ` · payoff in ~${newYears.toFixed(1)} yrs (was ${yearsLeft.toFixed(1)})` : " · PAID OFF 🎉"}
+          <div style={{ color: C.inkDim }}>Payment stays {fmt(p.loan.payment)}/mo until a rate reset re-amortizes.</div>
+        </div>
+      )}
+      <div className="flex gap-2 mt-4">
+        <button onClick={() => applyLump(p.id, amt)} disabled={amt <= 0 || amt > max} className="disp font-extrabold px-4 py-2" style={{ background: amt > 0 && amt <= max ? C.brass : C.felt3, color: amt > 0 && amt <= max ? "#1A1408" : C.inkDim, border: "none", borderRadius: 6 }}>APPLY</button>
+        <button onClick={close} className="mono text-sm px-3 py-2" style={{ background: C.felt3, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 6 }}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+function ReserveModal({ g, resAmt, setResAmt, transferReserve, close }) {
+  const amt = Number(resAmt) || 0;
+  return (
+    <div>
+      <div className="disp text-xl font-extrabold" style={{ color: C.gold }}>🏦 Reserve Account</div>
+      <div className="mono text-xs mt-1" style={{ color: C.inkDim }}>
+        A separate rainy-day stash. Still counts toward net worth, still earns the going Treasury yield ({(g.treasury * 100).toFixed(2)}%/yr) — but unlike operating cash, it's never touched automatically by repairs or surprises. You decide when it comes out.
+      </div>
+      <div className="grid grid-cols-2 gap-3 mt-3 mono text-sm">
+        <div style={{ background: C.felt3, borderRadius: 8, padding: 10 }}><div style={{ fontSize: 10, color: C.inkDim }}>OPERATING CASH</div><div style={{ color: g.cash < 0 ? C.flare : C.sprout }}>{fmtFull(g.cash)}</div></div>
+        <div style={{ background: C.felt3, borderRadius: 8, padding: 10 }}><div style={{ fontSize: 10, color: C.inkDim }}>RESERVE</div><div style={{ color: C.gold }}>{fmtFull(g.reserve)}</div></div>
+      </div>
+      <input type="number" value={resAmt} onChange={(e) => setResAmt(e.target.value)} placeholder="Amount" className="mono w-full mt-3 px-3 py-2" style={{ background: C.felt, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 6 }} />
+      <div className="flex gap-2 mt-3">
+        <button onClick={() => transferReserve("in", amt)} disabled={amt <= 0 || amt > g.cash} className="disp font-extrabold px-3 py-2 flex-1" style={{ background: amt > 0 && amt <= g.cash ? C.gold : C.felt3, color: amt > 0 && amt <= g.cash ? "#1A1408" : C.inkDim, border: "none", borderRadius: 6 }}>STOW AWAY ▸</button>
+        <button onClick={() => transferReserve("out", amt)} disabled={amt <= 0 || amt > g.reserve} className="disp font-extrabold px-3 py-2 flex-1" style={{ background: amt > 0 && amt <= g.reserve ? C.brass : C.felt3, color: amt > 0 && amt <= g.reserve ? "#1A1408" : C.inkDim, border: "none", borderRadius: 6 }}>PULL BACK ◂</button>
+      </div>
+      <button onClick={close} className="mono text-sm px-3 py-2 mt-3 w-full" style={{ background: C.felt3, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 6 }}>Close</button>
+    </div>
+  );
+}
+
+function SellModal({ g, modal, sellProp, close }) {
+  const p = g.properties.find((x) => x.id === modal.propId);
+  if (!p) return null;
+  const proceeds = p.value * 0.95 - p.loan.balance;
+  const gain = Math.max(0, p.value - p.basis);
+  const tax = 0.25 * gain;
+  return (
+    <div>
+      <div className="disp text-xl font-extrabold" style={{ color: C.brass }}>🏷️ Sell {p.name}</div>
+      <div className="mono text-xs mt-2 flex flex-col gap-1" style={{ color: C.ink }}>
+        <div>Sale price (value): <b>{fmtFull(p.value)}</b></div>
+        <div>Less 5% costs: −{fmtFull(p.value * 0.05)}</div>
+        <div>Less loan payoff: −{fmtFull(p.loan.balance)}</div>
+        <div style={{ color: C.sprout }}>Net proceeds: <b>{fmtFull(proceeds)}</b></div>
+        <div style={{ color: C.inkDim }}>Taxable gain {fmtFull(gain)} → tax {fmtFull(tax)} if cashing out</div>
+      </div>
+      <div className="flex flex-col gap-2 mt-4">
+        <button onClick={() => sellProp(p.id, "cash")} className="mono text-sm px-3 py-2 text-left" style={{ background: C.felt3, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 6 }}>💵 Cash out — receive {fmt(proceeds - tax)} after tax</button>
+        <button onClick={() => sellProp(p.id, "1031")} className="mono text-sm px-3 py-2 text-left" style={{ background: C.felt3, color: C.brass, border: `1px solid ${C.brass}`, borderRadius: 6 }}>🔄 1031 Exchange — {fmt(proceeds)} to escrow, tax deferred, must buy within 6 months</button>
+        <button onClick={close} className="mono text-xs px-3 py-1.5" style={{ background: "transparent", color: C.inkDim, border: "none" }}>Never mind</button>
+      </div>
+    </div>
+  );
+}
+
+function OMModal({ g, modal, buyDeal, escrowInput, setEscrowInput, close }) {
+  const d = g.market.find((x) => x.id === modal.dealId);
+  if (!d) return null;
+  const t = CREDIT_TIERS[d.tierIdx];
+  const l = LEASE_TYPES[d.leaseTypeIdx];
+  const minDown = d.price * (1 - d.ltv), closing = d.price * 0.02;
+  const escrowAvail = g.escrow ? g.escrow.amount : 0;
+  const escrowUsed = Math.max(0, Math.min(Number(escrowInput) || 0, escrowAvail, d.price));
+  const effectiveDown = Math.max(minDown, escrowUsed);
+  const loanAmt = d.price - effectiveDown;
+  const fromCashForDown = Math.max(0, effectiveDown - escrowUsed);
+  const fromCash = fromCashForDown + closing;
+  const can = fromCash <= g.cash;
+  const pay = pmtCalc(loanAmt, d.rate, d.amortYears);
+  const rentPerSqft = ((d.grossRentMo * 12) / d.sqft).toFixed(2);
+  const downPct = (effectiveDown / d.price) * 100;
+  return (
+    <div>
+      <div className="flex items-center justify-between">
+        <div className="mono text-xs" style={{ color: C.inkDim, letterSpacing: "0.08em" }}>OFFERING MEMORANDUM</div>
+        {d.hot && <div className="mono text-xs px-2 py-1" style={{ background: C.gold, color: "#1A1408", borderRadius: 4, fontWeight: 700 }}>🔥 {d.ttl}MO ON MARKET</div>}
+      </div>
+      <div className="disp text-2xl font-extrabold mt-1" style={{ color: C.brass }}>{d.emoji} {d.name}</div>
+      <div className="mono text-xs" style={{ color: C.inkDim }}>{d.sub}</div>
+
+      <div className="mt-3" style={{ background: C.felt3, borderRadius: 8, padding: 12 }}>
+        <div className="mono text-xs" style={{ color: C.inkDim, marginBottom: 4 }}>TENANT PROFILE</div>
+        <div className="flex items-center justify-between">
+          <div className="mono text-sm" style={{ color: C.ink }}>{d.tenantName}</div>
+          <TierBadge tierIdx={d.tierIdx} />
+        </div>
+        <div className="mono text-xs mt-1" style={{ color: t.color }}>{t.grade}</div>
+        <div className="text-xs mt-1" style={{ color: C.inkDim }}>{t.desc}</div>
+        <div className="mono text-xs mt-2 flex justify-between" style={{ color: C.ink }}><span>Lease term remaining</span><span>{d.leaseYearsLeft} yrs</span></div>
+        <div className="mono text-xs flex justify-between" style={{ color: C.ink }}><span>Est. renewal probability</span><span>{Math.round(t.renewalProb * 100)}%</span></div>
+        <div className="mono text-xs flex justify-between" style={{ color: C.ink }}><span>Mid-lease default risk</span><span>{(t.defaultRiskMo * 12 * 100).toFixed(1)}%/yr</span></div>
+      </div>
+
+      <div className="mt-3" style={{ background: C.felt3, borderRadius: 8, padding: 12 }}>
+        <div className="flex items-center justify-between">
+          <div className="mono text-xs" style={{ color: C.inkDim }}>LEASE STRUCTURE</div>
+          <LeaseBadge leaseTypeIdx={d.leaseTypeIdx} />
+        </div>
+        <div className="text-xs mt-1" style={{ color: C.inkDim }}>{l.desc}</div>
+        <div className="mono text-xs mt-2 flex justify-between" style={{ color: C.ink }}><span>Est. property tax /yr</span><span>{fmtFull(d.taxAnnual)}</span></div>
+        <div className="mono text-xs flex justify-between" style={{ color: C.ink }}><span>Est. insurance /yr</span><span>{fmtFull(d.insAnnual)}</span></div>
+        <div className="mono text-xs flex justify-between" style={{ color: C.ink }}><span>Tenant reimburses</span><span>{Math.round(l.taxPass*100)}% tax / {Math.round(l.insPass*100)}% ins</span></div>
+        <div className="mono text-xs flex justify-between" style={{ color: C.sprout }}><span>Your net landlord opex</span><span>{fmt(d.landlordOpexMo)}/mo</span></div>
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-3 mono text-xs" style={{ color: C.ink }}>
+        <div><span style={{ color: C.inkDim }}>Price</span><br />{fmtFull(d.price)}</div>
+        <div><span style={{ color: C.inkDim }}>Size</span><br />{d.sqft.toLocaleString()} SF</div>
+        <div><span style={{ color: C.inkDim }}>Cap rate (NOI)</span><br />{(d.cap * 100).toFixed(2)}%</div>
+        <div><span style={{ color: C.inkDim }}>Gross rent / SF / yr</span><br />${rentPerSqft}</div>
+        <div><span style={{ color: C.inkDim }}>NOI / mo</span><br />{fmtFull(d.noiMo)}</div>
+        <div><span style={{ color: C.inkDim }}>Loan rate</span><br />{(d.rate * 100).toFixed(2)}%</div>
+      </div>
+
+      {g.escrow && (
+        <div className="mt-3" style={{ background: C.felt3, borderRadius: 8, padding: 12 }}>
+          <div className="flex items-center justify-between">
+            <div className="mono text-xs" style={{ color: C.inkDim }}>1031 ESCROW TO APPLY</div>
+            <div className="mono text-xs" style={{ color: C.brass }}>{fmt(escrowAvail)} available</div>
+          </div>
+          <div className="flex gap-2 mt-2 flex-wrap">
+            <button onClick={() => setEscrowInput(String(Math.round(Math.min(minDown, escrowAvail))))} className="mono text-xs px-2 py-1" style={{ background: C.felt, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 4 }}>Minimum ({fmt(Math.min(minDown, escrowAvail))})</button>
+            <button onClick={() => setEscrowInput(String(Math.round(Math.min(escrowAvail, d.price) / 2)))} className="mono text-xs px-2 py-1" style={{ background: C.felt, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 4 }}>Half escrow</button>
+            <button onClick={() => setEscrowInput(String(Math.round(Math.min(escrowAvail, d.price))))} className="mono text-xs px-2 py-1" style={{ background: C.felt, color: C.gold, border: `1px solid ${C.gold}`, borderRadius: 4 }}>All escrow ({fmt(Math.min(escrowAvail, d.price))})</button>
+          </div>
+          <input type="number" value={escrowInput} onChange={(e) => setEscrowInput(e.target.value)} placeholder="Amount"
+            className="mono w-full mt-2 px-3 py-2" style={{ background: C.felt, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 6 }} />
+          <div className="mono text-xs mt-2" style={{ color: C.inkDim }}>
+            Putting in more than the minimum shrinks the loan directly — smaller payment, more day-1 cash flow, but less escrow left for a second replacement property before the 6-month window closes.
+          </div>
+        </div>
+      )}
+
+      <div className="mt-3" style={{ background: C.felt, borderRadius: 8, padding: 12, border: `1px solid ${C.line}` }}>
+        <div className="mono text-xs" style={{ color: C.inkDim, marginBottom: 4 }}>PURCHASE STRUCTURE</div>
+        <div className="mono text-xs flex flex-col gap-1" style={{ color: C.ink }}>
+          <div>Down {downPct.toFixed(0)}% (min {Math.round((1-d.ltv)*100)}%): {fmtFull(effectiveDown)} + closing 2%: {fmtFull(closing)}</div>
+          {escrowUsed > 0 && <div style={{ color: C.brass }}>From 1031 escrow: {fmtFull(escrowUsed)}</div>}
+          <div>From cash: {fmtFull(fromCash)}</div>
+          <div>New loan: {fmtFull(loanAmt)} @ {(d.rate * 100).toFixed(2)}%, {d.amortYears}-yr am → {fmt(pay)}/mo</div>
+          <div style={{ color: C.sprout }}>Day-1 cash flow: {fmt(d.grossRentMo - d.landlordOpexMo - pay)}/mo</div>
+        </div>
+      </div>
+
+      <div className="flex gap-2 mt-4">
+        <button onClick={() => buyDeal(d.id, escrowUsed)} disabled={!can} className="disp font-extrabold px-4 py-2" style={{ background: can ? C.brass : C.felt3, color: can ? "#1A1408" : C.inkDim, border: "none", borderRadius: 6 }}>CLOSE THE DEAL</button>
+        <button onClick={close} className="mono text-sm px-3 py-2" style={{ background: C.felt3, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 6 }}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+
+<script>
+  try {
+    var src = document.getElementById("app-source").textContent;
+    var out = Babel.transform(src, { presets: [["react", { runtime: "classic" }]] }).code;
+    var s = document.createElement("script");
+    s.textContent = out;
+    document.body.appendChild(s);
+  } catch (err) {
+    document.getElementById("boot-error").style.display = "block";
+    document.getElementById("boot-error").textContent = "RE Mogul failed to start:\n" + (err && err.message ? err.message : err);
+    console.error(err);
+  }
+</script>
+
+<script>
+  // Register a minimal service worker for offline play once added to home screen.
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("sw.js").catch(function () {});
+    });
+  }
+</script>
+</body>
+</html>
